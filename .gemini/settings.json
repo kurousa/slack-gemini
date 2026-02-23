@@ -1,0 +1,14 @@
+{
+  "contextFileName": "AGENTS.md",
+  "mcpServers": {
+    "Snyk Security Scanner": {
+      "command": "snyk",
+      "args": [
+        "mcp",
+        "-t",
+        "stdio",
+        "--experimental"
+      ]
+    }
+  }
+}
