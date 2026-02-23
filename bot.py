@@ -17,21 +17,30 @@ class GeminiAgent:
     """Gemini CLIとのインターフェースを担当するクラス"""
     
     def __init__(self):
+        # 思考プロセスやツールログを除去するためのパターン
         self._preamble_patterns = re.compile(
-            r"^(I'll |I will |Let me |I need to |I should |Checking |Looking |Reading |Searching )",
+            r"^(I'll |I will |Let me |I need to |I should |Checking |Looking |Reading |Searching |Executing |\[tool:)",
             re.IGNORECASE,
         )
 
-    def strip_preamble(self, text: str) -> str:
-        """Gemini CLIの思考/行動宣言部分を削除し、純粋な回答のみを返す"""
-        paragraphs = text.split("\n\n")
-        while paragraphs:
-            first = paragraphs[0].strip()
-            if not first or self._preamble_patterns.match(first):
-                paragraphs.pop(0)
-            else:
-                break
-        return "\n\n".join(paragraphs).strip() if paragraphs else text.strip()
+    def clean_output(self, text: str) -> str:
+        """内部ログや英語の独り言を排除し、純粋な回答のみを抽出する"""
+        lines = text.splitlines()
+        cleaned_lines = []
+        
+        # ツール実行ログや「I will...」で始まる行をスキップ
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if self._preamble_patterns.match(stripped):
+                continue
+            cleaned_lines.append(line)
+        
+        result = "\n".join(cleaned_lines).strip()
+        
+        # もし空になってしまった場合は元のテキストを返す（保険）
+        return result if result else text.strip()
 
     def run(self, prompt: str, cwd: str = None) -> str:
         """Gemini CLIを実行し、クリーンな結果を取得する"""
@@ -46,7 +55,7 @@ class GeminiAgent:
         stderr = process.stderr.strip()
         
         if stdout:
-            return self.strip_preamble(stdout)
+            return self.clean_output(stdout)
         elif stderr:
             return f"Error output:\n{stderr}"
         else:
@@ -125,7 +134,7 @@ class SlackUIManager:
         if len(text) <= limit:
             return text
         
-        suffix = "\n\n... (文字数制限のため以下略。詳細はCLIまたはログを確認してください)"
+        suffix = "\n\n... (文字数制限のため以下略)"
         return text[:limit - len(suffix)] + suffix
 
     def build_thread_context(self, channel: str, thread_ts: str, bot_user_id: str) -> str:
@@ -203,7 +212,7 @@ class SlackUIManager:
         return [
             {
                 "type": "section",
-                "text": {"type": "mrkdwn", "text": "🛠️ *修正が完了しました。* 内容を確認し、コミットとプッシュ（GitHubへの反映）を実行しますか？"}
+                "text": {"type": "mrkdwn", "text": "🛠️ *修正が完了しました。* 内容を確認し、コミットとプッシュを実行しますか？"}
             },
             {
                 "type": "actions",
@@ -238,7 +247,6 @@ class SnykWorkflowHandler:
         self.slack_ui = slack_ui
         self.logger = logging.getLogger(__name__ + ".SnykWorkflowHandler")
 
-        # アクションリスナーの登録
         self.app.action("approve_snyk_fix")(self.handle_approve_fix)
         self.app.action("approve_commit")(self.handle_commit_fix)
         self.app.action("cancel_workflow")(self.handle_cancel_workflow)
@@ -255,18 +263,21 @@ class SnykWorkflowHandler:
         for att in event.get("attachments", []):
             alert_context += "\n" + att.get("fallback", "")
         
-        say(f"🔍 プロジェクト `{project_name}` の脆弱性を検知しました。AIコンシェルジュが調査を開始します...", thread_ts=thread_ts)
+        say(f"🔍 プロジェクト `{project_name}` の調査を開始します。少々お待ちください...", thread_ts=thread_ts)
         
         try:
             target_dir = self.project_mgr.setup_repository(project_name)
             
+            # 内部ログを抑制し、日本語で結論だけ出すようにプロンプトを調整
             plan_instruction = (
-                f"必ず `.agent/skills/fix-snyk/SKILL.md` を参照し、その手順に従ってください。\n"
-                f"次のセキュリティアラートについて、詳細を調査し、修正方針（Plan）を日本語で提示してください。\n"
-                f"※まだファイルの修正は実行しないでください。\n\nアラート内容:\n{alert_context}"
+                f"あなたは一流のセキュリティエンジニアとして、`.agent/skills/fix-snyk/SKILL.md` の手順に従い、"
+                f"以下のSnykアラートに対する具体的な「修正方針（Plan）」を策定してください。\n"
+                f"【制約】内部の思考プロセスやコマンド実行ログは一切出力しないでください。必ず日本語で、箇条書きで簡潔に結論だけを出力してください。\n\nアラート内容:\n{alert_context}"
             )
             
             plan_result = self.gemini.run(plan_instruction, cwd=target_dir)
+            self.logger.info(f"Plan result: {plan_result}")
+            
             blocks = self.slack_ui.create_approval_blocks(plan_result, project_name, target_dir)
             
             self.app.client.chat_postMessage(
@@ -277,7 +288,7 @@ class SnykWorkflowHandler:
             )
         except Exception as e:
             self.logger.error(f"Failed during plan phase: {e}")
-            say(f"❌ 計画の作成中にエラーが発生しました: {str(e)}", thread_ts=thread_ts)
+            say(f"❌ エラーが発生しました: {str(e)}", thread_ts=thread_ts)
 
     def handle_approve_fix(self, ack, body, say, client):
         """「修正を許可する」ボタン押下時の処理"""
@@ -291,32 +302,27 @@ class SnykWorkflowHandler:
         data = json.loads(action["value"])
         target_dir = data["dir"]
 
-        # UI更新：ボタンを消して実行中にする
         client.chat_update(
             channel=channel_id,
             ts=message_ts,
             text="🛠️ 修正処理を実行中...",
-            blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": "🛠️ *承認されました。* 修正処理を実行中です..."}}]
+            blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": "🛠️ *承認されました。* 修正を実行しています..."}}]
         )
 
         try:
             fix_instruction = (
-                f"必ず `.agent/skills/fix-snyk/SKILL.md` の手順に従い、"
-                f"先ほど提示した修正方針に基づいて対象ファイルを実際に書き換えてください。"
-                f"修正完了後、どのような変更を行ったかの要約を出力してください。"
+                f"`.agent/skills/fix-snyk/SKILL.md` の手順に基づき、対象ファイルを実際に修正してください。"
+                f"完了後、変更内容を日本語で簡潔に要約してください。内部ログは出力しないでください。"
             )
             fix_result = self.gemini.run(fix_instruction, cwd=target_dir)
             git_status = self.project_mgr.get_git_status(target_dir)
             
             safe_fix_result = self.slack_ui.safe_truncate(fix_result)
-            
-            # 修正結果の報告とコミットボタンの提示
             result_text = f"✅ *修正が完了しました！*\n\n*作業サマリ:*\n```\n{safe_fix_result}\n```\n"
             if git_status:
                 result_text += f"\n*変更されたファイル:*\n```\n{git_status}```"
             
             commit_blocks = self.slack_ui.create_commit_blocks(data["project"], target_dir)
-            
             client.chat_postMessage(
                 channel=channel_id,
                 thread_ts=thread_ts,
@@ -324,7 +330,7 @@ class SnykWorkflowHandler:
                 blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": result_text}}] + commit_blocks
             )
         except Exception as e:
-            say(f"❌ 修正の実行中にエラーが発生しました: {str(e)}", thread_ts=thread_ts)
+            say(f"❌ 修正中にエラーが発生しました: {str(e)}", thread_ts=thread_ts)
 
     def handle_commit_fix(self, ack, body, say, client):
         """「コミット＆プッシュ」ボタン押下時の処理"""
@@ -341,31 +347,27 @@ class SnykWorkflowHandler:
         client.chat_update(
             channel=channel_id,
             ts=message_ts,
-            text="🚀 コミット＆プッシュ中...",
-            blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": "🚀 *承認されました。* コミットとプッシュを実行中です..."}}]
+            text="🚀 コミット中...",
+            blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": "🚀 *承認されました。* 反映作業を行っています..."}}]
         )
 
         try:
-            # Geminiにコミットとプッシュを依頼する
-            commit_instruction = "修正内容を適切なコミットメッセージと共にコミットし、現在のブランチをリモートにプッシュしてください。成功したら結果を報告してください。"
+            commit_instruction = "修正内容を適切なメッセージでコミットし、プッシュしてください。結果を日本語で報告してください。"
             commit_result = self.gemini.run(commit_instruction, cwd=target_dir)
-            
             say(f"✨ *完了しました！*\n```\n{commit_result}\n```", thread_ts=thread_ts)
         except Exception as e:
-            say(f"❌ コミット中にエラーが発生しました: {str(e)}", thread_ts=thread_ts)
+            say(f"❌ エラーが発生しました: {str(e)}", thread_ts=thread_ts)
 
     def handle_cancel_workflow(self, ack, body, client):
-        """「キャンセル」ボタン押下時の処理（共通）"""
         ack()
         channel_id = body["channel"]["id"]
         message_ts = body["message"]["ts"]
         user_id = body["user"]["id"]
-        
         client.chat_update(
             channel=channel_id,
             ts=message_ts,
             text="キャンセルされました",
-            blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": f"🚫 <@{user_id}> によって処理が中断されました。"}}]
+            blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": f"🚫 <@{user_id}> によって中断されました。"}}]
         )
 
 
@@ -373,8 +375,6 @@ class SnykWorkflowHandler:
 # 5. メインBotアプリケーション (ConciergeBot)
 # ==========================================
 class ConciergeBot:
-    """オーケストレーター"""
-
     def __init__(self, app: App):
         self.app = app
         self.logger = logging.getLogger(__name__ + ".ConciergeBot")
@@ -413,16 +413,13 @@ class ConciergeBot:
             return
         
         self.logger.info(f"Received !ghost command: {instruction}")
-        
-        context_text = ""
-        if "thread_ts" in event:
-            bot_user_id = self.app.client.auth_test()["user_id"]
-            context_text = self.slack_ui.build_thread_context(channel, thread_ts, bot_user_id)
+        bot_user_id = self.app.client.auth_test()["user_id"]
+        context_text = self.slack_ui.build_thread_context(channel, thread_ts, bot_user_id)
 
-        if context_text:
-            full_prompt = f"以下は過去の会話履歴です:\n---\n{context_text}\n---\n\n上記の会話を踏まえて、以下の質問に回答してください:\n{instruction}"
-        else:
-            full_prompt = instruction
+        full_prompt = (
+            f"以下は過去の会話履歴です:\n---\n{context_text}\n---\n\n"
+            f"上記の会話を踏まえて回答してください。必ず日本語を使用し、最終的な回答のみを出力してください。\n指示: {instruction}"
+        )
 
         processing_msg = say("⏳ Gemini 処理中...", thread_ts=thread_ts)
         
@@ -438,7 +435,6 @@ class ConciergeBot:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     load_dotenv()
-
     app_token = os.environ.get("SLACK_APP_TOKEN")
     bot_token = os.environ.get("SLACK_BOT_TOKEN")
 
