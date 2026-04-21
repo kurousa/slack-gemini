@@ -5,6 +5,6 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "python-dotenv>=1.2.1",
+    "python-dotenv>=1.2.2",
     "slack-bolt>=1.27.0",
 ]
